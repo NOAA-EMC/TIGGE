@@ -14,13 +14,18 @@ our $gefs_filepattern = qr(^ge[cp](\d\d)\.t(\d\d)z\.pgrb2(a|b|st)(\.(?:0p50|0p25
 our @ISA = qw(Exporter);
 
 our %EXPORT_TAGS = ( 'all' => 	[
-   qw( %RequiredVariablesA %RequiredVariablesB $GRIB_API_BIN $gefs_filepattern &cleanupLocation &mergeRecords &convertToCCSDS &qcGensFile &qcGensCycle &qcOutput &runLatest &getDTGfromGensFileName &archiveOutput &packCycle &FCT_HOURS &FCT_INC) 
+   qw( %RequiredVariablesA %RequiredVariablesB $GRIB_API_BIN $gefs_filepattern &cleanupLocation &mergeRecords &convertToCCSDS &setTestStatus &qcGensFile &qcGensCycle &qcOutput &runLatest &getDTGfromGensFileName &archiveOutput &packCycle &FCT_HOURS &FCT_INC) 
 								] );
 
 our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
 
 our $VERSION = "1.5";
 our $REVISION_DATE = "20190315";
+
+# Inherit from parent Bash environment; default safely to 0 (prod) if unset
+our $isTestMode = (defined $ENV{TIGGE_TEST_MODE} && $ENV{TIGGE_TEST_MODE} eq '1') ? 1 : 0;
+
+print STDOUT "Running TIGGE pipeline in " . ($isTestMode ? "TEST (status=5)" : "PROD (status=4)") . " mode.\n";
 
 # Preloaded methods go here.
 
@@ -1433,6 +1438,14 @@ closedir(DIR);
 
 ncdcTigge::mergeRecords( $archiveTargetDir, $archiveTargetDir, $cycle );
 ncdcTigge::convertToCCSDS( $archiveTargetDir, $archiveTargetDir, $cycle );
+
+if ( $isTestMode ) {
+    my $testRtn = ncdcTigge::setTestStatus( $archiveTargetDir, $archiveTargetDir, $cycle );
+    if ( $testRtn != 0 ) {
+        die "Aborting archive creation: setTestStatus failed with code $testRtn\n";
+    }
+}
+
 print STDOUT "Merging into master archive: $masterArchive\n\n";
 unlink($masterArchive);
 my @tarRtn =  (`tar -cf $masterArchive z_tigge_c_kwbc_${cycle}0000_*.grib`);
@@ -1707,6 +1720,75 @@ sub convertToCCSDS($$$) {
     }
 }
 
+sub setTestStatus($$$) {
+    my $headline = "$0:ncdcTigge::setTestStatus(@_)";
+    my $dir      = shift(@_);
+    my $dirOut   = shift(@_);
+    my $cyc      = shift(@_);
+
+    if ( $cyc !~ m/^\d{10}$/ ) { return(1); }
+    if ( !(-d $dir) || !(-r $dir) ) { return(2); }
+
+    if ( $dirOut eq "" ) { $dirOut = $dir; }
+    if ( !(-d $dirOut) ) { mkdir($dirOut); }
+    if ( !(-d $dirOut) ) { $dirOut = $dir; }
+
+    my $GRIB_SET = "$ENV{eccodes_ROOT}/bin/grib_set";
+    if ( !(-e $GRIB_SET) ) {
+        print STDERR "### $headline : $GRIB_SET executable was not found!\n\n";
+        return(2);
+    }
+    if ( !(-x $GRIB_SET) ) {
+        print STDERR "### $headline : $GRIB_SET is not executable!\n\n";
+        return(2);
+    }
+
+    my $pattern = "${dir}/z_tigge_c_kwbc_${cyc}0000_*_prod_*.grib";
+    my @gribFiles = glob($pattern);
+
+    if ( $#gribFiles <= -1 ) { return(-16); }
+
+    print STDOUT "Updating " . scalar(@gribFiles) . " GRIB2 files to TIGGE test status (5)...\n";
+
+    my @checkErrors;
+    foreach my $inFile (@gribFiles) {
+        my $baseName = File::Basename::basename($inFile);
+        my $testName = $baseName;
+        $testName =~ s/_prod_/_test_/;
+
+        my $outFile = "${dirOut}/${testName}";
+        my $tmpFile = "${outFile}.tmp";
+
+        my @rtn = `$GRIB_SET -s productionStatusOfProcessedData=5 $inFile $tmpFile 2>&1`;
+
+        if ( $#rtn > -1 ) {
+            push(@checkErrors, "Error updating test status on $inFile: @rtn");
+            unlink($tmpFile) if -e $tmpFile;
+        } else {
+            if (-s $tmpFile) {
+                rename($tmpFile, $outFile);
+                # Remove original _prod_ file when operating in-place so tar doesn't grab both
+                if ($inFile ne $outFile && $dir eq $dirOut) {
+                    unlink($inFile);
+                }
+                print STDOUT "Updated to test: $testName\n";
+            } else {
+                push(@checkErrors, "Error: $inFile test status update failed silently.\n");
+                unlink($tmpFile) if -e $tmpFile;
+            }
+        }
+    }
+
+    if (@checkErrors) {
+        print STDERR "The following errors occurred while setting test status:\n";
+        print STDERR @checkErrors;
+        return(8);
+    } else {
+        print STDOUT "Test status update completed without errors.\n\n";
+        return(0);
+    }
+}
+
 #
 #       Utility function - obtains dates from gens filenames
 #
@@ -1896,6 +1978,22 @@ X)  Ships the data to an FTP server at NCAR
                                    2  = Missing/unreadable dir or grib_set executable
                                   -16 = No matching GRIB files found
                                    8  = Conversion failure on one or more files
+
+ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+sub setTestStatus($$$)
+                Updates GRIB2 productionStatusOfProcessedData to 5 (TIGGE test)
+                and renames _prod_ files to _test_ for a given cycle.
+
+                1->      PATH    Input directory containing GRIB2 files
+                2->      PATH    Output directory (same as input for in-place)
+                3->      String  Cycle "YYYYMMDDHH" to target within input directory
+                <-       INT     Return code:
+                                   0  = Success
+                                   1  = Invalid cycle format
+                                   2  = Missing/unreadable dir or grib_set executable
+                                  -16 = No matching _prod_ GRIB files found
+                                   8  = Header update failure on one or more files
 
  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 

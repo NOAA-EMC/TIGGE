@@ -9,18 +9,23 @@ use File::Path;
 
 require Exporter;
 
-our $gefs_filepattern = qr(^ge[cp](\d\d)\.t(\d\d)z\.pgrb2([ab])(\.0p50\.)?f(\d{2,3})$);
+our $gefs_filepattern = qr(^ge[cp](\d\d)\.t(\d\d)z\.pgrb2(a|b|st)(\.(?:0p50|0p25)\.)?f(\d{2,3})$);
 
 our @ISA = qw(Exporter);
 
 our %EXPORT_TAGS = ( 'all' => 	[
-   qw( %RequiredVariablesA %RequiredVariablesB $GRIB_API_BIN $gefs_filepattern &cleanupLocation &mergeRecords &qcGensFile &qcGensCycle &qcOutput &runLatest &getDTGfromGensFileName &archiveOutput &packCycle &FCT_HOURS &FCT_INC) 
+   qw( %RequiredVariablesA %RequiredVariablesB $GRIB_API_BIN $gefs_filepattern &cleanupLocation &mergeRecords &convertToCCSDS &setTestStatus &qcGensFile &qcGensCycle &qcOutput &runLatest &getDTGfromGensFileName &archiveOutput &packCycle &FCT_HOURS &FCT_INC) 
 								] );
 
 our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
 
 our $VERSION = "1.5";
 our $REVISION_DATE = "20190315";
+
+# Inherit from parent Bash environment; default safely to 0 (prod) if unset
+our $isTestMode = (defined $ENV{TIGGE_TEST_MODE} && $ENV{TIGGE_TEST_MODE} eq '1') ? 1 : 0;
+
+print STDOUT "Running TIGGE pipeline in " . ($isTestMode ? "TEST (status=5)" : "PROD (status=4)") . " mode.\n";
 
 # Preloaded methods go here.
 
@@ -40,8 +45,15 @@ sub get_n_members($) {
     }
 }
 
-sub getQcNumPoints($) {
-    my ($cycle) = @_;
+sub getQcNumPoints {
+    my ($cycle, $grib_type) = @_;
+
+    # 0.25-degree grid for 'st' files (1440 x 721)
+    if (defined $grib_type && $grib_type eq 'st') {
+        return 1038240;
+    }
+
+    # Historical/Current thresholds for 'a' and 'b' files
     if ($cycle >= 2020092312) {
         return 259920;   # Number of datapoints contained in 0.5-deg Grid
     } else {
@@ -61,6 +73,11 @@ $ncdcTigge::startTime = time;
 	# PACKAGE LEVEL "Public" (our scope) VARIABLES / CONSTANTS
 # our $ENS_MEMBERS    = 20;		# Maximum number of members
 our $FCT_HOURS      = 384;		# Maximum forecast hours
+our %FCT_HOURS = (                      # Maximum forecast hours
+    'a' => 384,
+    'b' => 384,
+    'st' => 240,
+);
 our $FCT_INC        = 6;		# Default forecast hour increment
 
 	# For QC -- Record counts per file-type and date
@@ -69,11 +86,15 @@ our %aAnlRecCount;
 our %bAnlRecCount;
 our %aFctRecCount;
 our %bFctRecCount;
+our %stAnlRecCount;
+our %stFctRecCount;
 
 $aAnlRecCount{"0000000000"} = 45;
 $bAnlRecCount{"0000000000"} = 283;
 $aFctRecCount{"0000000000"} = 51;
 $bFctRecCount{"0000000000"} = 288;
+$stAnlRecCount{"0000000000"} = 35;
+$stFctRecCount{"0000000000"} = 47;
 
 $aAnlRecCount{"2010022312"} = 73;
 $aAnlRecCount{"2015120212"} = 69;
@@ -81,7 +102,10 @@ $bAnlRecCount{"2010022312"} = 258;
 $aFctRecCount{"2010022312"} = 79;
 $bFctRecCount{"2010022312"} = 262;
 
-
+$aAnlRecCount{"2020092312"} = 71;
+$aFctRecCount{"2020092312"} = 85;
+$bAnlRecCount{"2020092312"} = 473;
+$bFctRecCount{"2020092312"} = 505;
 
 	# FTP download variables
 our $ftpSrcSite		= "ftpprd.ncep.noaa.gov";		# Gens Download location
@@ -111,10 +135,12 @@ our $qcCenterCode 	= "kwbc";	# Accepted originating center code (NWS/NCEP)
 our $qcRecByteMin	= 128;		# Minimum byte size for ANY grib2 record
 our $qcGensProcessIdNum = 4;	# GRIB2 Generating process ID for GENS model
 
-our $qcGensAnlARecCount	= 45;
-our $qcGensFctARecCount	= 51;
-our $qcGensAnlBRecCount	= 283;
-our $qcGensFctBRecCount	= 288;
+our $qcGensAnlARecCount  = 71;
+our $qcGensFctARecCount  = 85;
+our $qcGensAnlBRecCount  = 473;
+our $qcGensFctBRecCount  = 505;
+our $qcGensAnlSTRecCount = 35;
+our $qcGensFctSTRecCount = 47;
 
 our %RequiredVariablesA = (
 	"Categorical Snow",			"0,1,95,,,,",
@@ -303,24 +329,33 @@ undef my %RecsPerFctHr;
 
 # my @rtn2 = (`/bin/ls $ENV{home}`);
 
+# start
+my ($inFile, $cycle) = @_;
+
+$inFile =~ s/\/*\//\//g;
+my $inFileName = $inFile;
+$inFileName =~ s/^.*\///g;
+
+my $grib_type = 'a'; # fallback default
+    if ($inFileName =~ $gefs_filepattern) {
+        $grib_type = $3; # Captures 'a', 'b', or 's' from regex
+    }
+
         # Inport module level QC Settings
 my $CENTER 			= $ncdcTigge::qcCenterCode;
 my $REC_BYTE_MIN	= $ncdcTigge::qcRecByteMin;
 my $GEN_PROCESS_NUM	= $ncdcTigge::qcGensProcessIdNum;
 # my $NUM_POINTS 		= $ncdcTigge::qcNumPoints;
-my $MAX_FCT 		= $ncdcTigge::FCT_HOURS;
+my $MAX_FCT = $ncdcTigge::FCT_HOURS{$grib_type} // 384;
 my $GRIB_LS = "${ncdcTigge::GRIB_API_BIN}/grib_ls";
 
 my $ArecCountAnl = $ncdcTigge::qcGensAnlARecCount;
 my $ArecCountFct = $ncdcTigge::qcGensFctARecCount;
 my $BrecCountAnl = $ncdcTigge::qcGensAnlBRecCount;
 my $BrecCountFct = $ncdcTigge::qcGensFctBRecCount;
+my $STrecCountAnl = $ncdcTigge::qcGensAnlSTRecCount;
+my $STrecCountFct = $ncdcTigge::qcGensFctSTRecCount;
 
-# start
-my ($inFile, $cycle) = @_;
-$inFile =~ s/\/*\//\//g;
-my $inFileName = $inFile;
-$inFileName =~ s/^.*\///g;
 if( !(-e $inFile) )
     { return(1,"File related error","File \"$inFile\" does not exist!\n\n"); }
 if( !(-r $inFile) )
@@ -375,6 +410,16 @@ foreach my $k ( sort keys (%bFctRecCount ) )
 	if( $dtg ge $k )
 		{ $BrecCountFct = $ncdcTigge::bFctRecCount{$k}; }
 	}
+foreach my $k ( sort keys (%stAnlRecCount ) )
+        {
+            if( $dtg ge $k )
+                { $STrecCountAnl = $ncdcTigge::stAnlRecCount{$k}; }
+        }
+foreach my $k ( sort keys (%stFctRecCount ) )
+        {
+            if( $dtg ge $k )
+                { $STrecCountFct = $ncdcTigge::stFctRecCount{$k}; }
+        }
 
 my @varArray;       # Holds list of category,varNum / for all records
 my @rtn = (`$GRIB_LS -p $gribLsKeysString $inFile `);
@@ -471,7 +516,7 @@ foreach my $line ( @rtn )
         "\n\tQC Warning:$numLine  Invalid forecast hour ($lineData[6])");
         }
     if( ($lineDataCount == $gribLsKeyCount) &&
-            ($lineData[7] != getQcNumPoints($cycle)) )
+            ($lineData[7] != getQcNumPoints($cycle, $grib_type)) )
         {
         push(@messages,
         "\n\tQC Warning:$numLine  Wrong #data-points ($lineData[7])");
@@ -526,7 +571,7 @@ if( $gensFileType eq "b" )
     if( ($priFct == 0) && ($numRec < ($BrecCountAnl-$LOOSENESS)) )
         {
         push(@messages,
-        "\n\tTEST QC Warning:  Expected $ArecCountAnl Records, found $numRec\n");
+        "\n\tTEST QC Warning:  Expected $BrecCountAnl Records, found $numRec\n");
         }
     if( ($priFct > 0) && ($numRec < ($BrecCountFct-$LOOSENESS)) )
         {
@@ -534,6 +579,22 @@ if( $gensFileType eq "b" )
         "\n\tTEST QC Warning:  Expected $BrecCountFct Records, found $numRec\n");
         }
     }
+
+    # Specific checks for ST files
+if( $gensFileType eq "st" )
+    {
+    if( ($priFct == 0) && ($numRec < ($STrecCountAnl-$LOOSENESS)) )
+        {
+        push(@messages,
+        "\n\tTEST QC Warning:  Expected $STrecCountAnl Records, found $numRec\n");
+        }
+    if( ($priFct > 0) && ($numRec < ($STrecCountFct-$LOOSENESS)) )
+        {
+        push(@messages,
+        "\n\tTEST QC Warning:  Expected $STrecCountFct Records, found $numRec\n");
+        }
+    }
+
 
 # print STDOUT "\n\nValid GENS\-$gensFileType file  [$inFileName]\n";
 # print STDOUT "Done:  Read $numLine lines, found $numRec Valid Records.\n\n";
@@ -550,9 +611,6 @@ return(0,"OK",@messages);
 sub qcGensCycle($;$;$)
 {
 my $headline = "$0:ncdcTigge::qcGensCycle : ";
-my $MEM_FILES = 65;
-if( $ncdcTigge::FCT_INC != 0 ) 
-	{ $MEM_FILES = int($ncdcTigge::FCT_HOURS / $ncdcTigge::FCT_INC) +1; }
 
 my $inDir = shift(@_);
 my $cycle = shift(@_);
@@ -628,45 +686,68 @@ if ( $#dirTags > -1 )
 
 undef my %filesPerMember;
 undef my %fileFound;
+#foreach my $thisFile ( @dirGrb ) {
+#    my $thisPath = "${inDir}/$thisFile";
+#    if(  (-z $thisPath) ) { next; }
+#    if( !(-r $thisPath) ) { next; }
+#    my @fnParts = split(/[\.\-\_]/,$thisFile);
+#    my ( $inFileParseMem, $inFileParseCycle, $inFileParseType, $inFileParseFct ) =
+#         $thisFile =~ m/$gefs_filepattern/i;
+#    my $memberCode = "$inFileParseMem-$inFileParseType";
+#    $filesPerMember{$memberCode}++;
+#    my $hourCode = "$inFileParseMem-$inFileParseType-$inFileParseFct";
+#    $fileFound{$hourCode} = 1;
+#}
+
 foreach my $thisFile ( @dirGrb ) {
     my $thisPath = "${inDir}/$thisFile";
     if(  (-z $thisPath) ) { next; }
     if( !(-r $thisPath) ) { next; }
-    my @fnParts = split(/[\.\-\_]/,$thisFile);
-    my ( $inFileParseMem, $inFileParseCycle, $inFileParseType, $inFileParseFct ) = 
-         $thisFile =~ m/$gefs_filepattern/i;
-    my $memberCode = "$inFileParseMem-$inFileParseType";
-    $filesPerMember{$memberCode}++;
-    my $hourCode = "$inFileParseMem-$inFileParseType-$inFileParseFct";
-    $fileFound{$hourCode} = 1;
+
+    if ( $thisFile =~ $gefs_filepattern ) {
+        my $inFileParseMem  = sprintf("%02d", $1); # Group 1: Member (e.g., '00')
+        my $inFileParseType = $3;                  # Group 3: Type ('a', 'b', or 's')
+        my $inFileParseFct  = sprintf("%03d", $5); # Group 5: Forecast hour (e.g., '000')
+
+        my $memberCode = "$inFileParseMem-$inFileParseType";
+        $filesPerMember{$memberCode}++;
+
+        my $hourCode = "$inFileParseMem-$inFileParseType-$inFileParseFct";
+        $fileFound{$hourCode} = 1;
+    }
 }
 
 for( my $m = 0; $m < get_n_members($cycle); $m++ ) {
-    my $aKey = sprintf("%02d-%1s",$m,"a");
-    my $bKey = sprintf("%02d-%1s",$m,"b");
-	if( !defined($filesPerMember{$aKey}) ) 
-		{ return("### $headline FAILED Member \# ${m}-a No files found!\n"); }
-	if( !defined($filesPerMember{$bKey}) )
-		{ return("### $headline FAILED Member \# ${m}-b No files found!\n"); }
-    my $aCount = $filesPerMember{$aKey};
-    my $bCount = $filesPerMember{$bKey};
-    if( $aCount != $MEM_FILES) {
-        for ( my $f=0; $f < $ncdcTigge::FCT_HOURS; $f+=$ncdcTigge::FCT_INC ) {
-            my $hourCode = sprintf("%02-a-%02",$m,$f);
-            if( !$fileFound{$hourCode} ) {
-              print STDERR " ! MISSING A FILE: $inDir Member ${m} / Fct $f \n";
-            }
+    my $memStr = sprintf("%02d", $m); # Formats member as '00', '01', etc.
+
+    # Loop through each GRIB type explicitly
+    foreach my $type ('a', 'b', 'st') {
+        my $key = "$memStr-$type";
+
+        my $max_fct = $ncdcTigge::FCT_HOURS{$type} // $ncdcTigge::FCT_HOURS;
+        my $expected_files = 65; # fallback
+        if ( $ncdcTigge::FCT_INC != 0 ) {
+            $expected_files = int($max_fct / $ncdcTigge::FCT_INC) + 1;
         }
-        return("### $headline FAILED Member \# ${m}-a Does not contain $MEM_FILES files, ($aCount Found) \n");
-    }
-    if( $bCount != $MEM_FILES) {
-        for ( my $f=0; $f < $ncdcTigge::FCT_HOURS; $f+=$ncdcTigge::FCT_INC ) {
-            my $hourCode = sprintf("%02-b-%02",$m,$f);
-            if( !$fileFound{$hourCode} ) {
-              print STDERR " ! MISSING B FILE: $inDir Member ${m} / Fct $f \n";
-            }
+
+        if( !defined($filesPerMember{$key}) ) {
+            return("### $headline FAILED Member \# ${memStr}-${type} No files found!\n");
         }
-        return("### $headline FAILED Member \# ${m}-b Does not contain $MEM_FILES.\n files, ($bCount Found) \n");
+
+        my $count = $filesPerMember{$key};
+        if( $count != $expected_files ) {
+
+            # If not, loop through forecast hours to find exactly which ones are missing
+            for ( my $f = 0; $f <= $max_fct; $f += $ncdcTigge::FCT_INC ) {
+                my $fctStr = sprintf("%03d", $f); # Formats hour as '000', '006'
+                my $hourCode = "$memStr-$type-$fctStr"; # e.g. '00-a-000'
+
+                if( !$fileFound{$hourCode} ) {
+                    print STDERR " ! MISSING $type FILE: $inDir Member ${memStr} / Fct $fctStr \n";
+                }
+            }
+            return("### $headline FAILED Member \# ${memStr}-${type} Does not contain $expected_files files, ($count Found) \n");
+        }
     }
 }
     # Execute Slow, deep file scan on every file.
@@ -759,9 +840,17 @@ if( !(-r $ENV{'TIGGE_OUTPUT'}) )
 	{ return("FAIL","$headline : tigge/Output directory is not readable!! \"$ENV{'TIGGE_OUTPUT'}\" \n"); }
 
 
-my $numVars = $#ncdcTigge::tiggeVarCodes + 1;
-my $expectedVarCount = get_n_members($cycle) * ($ncdcTigge::FCT_HOURS / $ncdcTigge::FCT_INC +1);
-my $expectedCycleCount = $expectedVarCount * $numVars;
+our %VARS_384 = map { $_ => 1 } qw(pt);
+
+my $memberCount   = get_n_members($cycle);
+my $stepsStandard = ($ncdcTigge::FCT_HOURS{'st'} / $ncdcTigge::FCT_INC) + 1; # 41 steps
+my $stepsPt       = ($ncdcTigge::FCT_HOURS{'a'} / $ncdcTigge::FCT_INC) + 1; # 65 steps 
+
+my $expectedCycleCount = 0;
+foreach my $varCode (@ncdcTigge::tiggeVarCodes) {
+    my $steps = $VARS_384{$varCode} ? $stepsPt : $stepsStandard;
+    $expectedCycleCount += $memberCount * $steps;
+}
 
 print STDOUT " * Scanning dir; [$ENV{'TIGGE_OUTPUT'}] \n";
 opendir(OUTDIR,$ENV{'TIGGE_OUTPUT'}) || 
@@ -770,13 +859,6 @@ my @fileList = sort grep(/\.grib$/,readdir(OUTDIR));
 closedir(OUTDIR);
 my @cycleFileList = grep(/_${cycle}/,@fileList);
 
-# print STDOUT " DEBUG 
-# my numVars = $#ncdcTigge::tiggeVarCodes + 1;
-# my expectedVarCount = $ncdcTigge::ENS_MEMBERS * $ncdcTigge::FCT_HOURS;
-# numVars				$numVars
-# expectedVarCount 	$expectedVarCount
-# expectedCycleCount	$expectedCycleCount
-# [$#fileList] [$#cycleFileList] \n";
 
 my $cycFileCount = $#cycleFileList+1;
 if( $cycFileCount < $expectedCycleCount ) 
@@ -787,9 +869,22 @@ foreach my $tVar ( @ncdcTigge::tiggeVarCodes )
 	{
 	my $ptn = "_${tVar}.grib\$";
 	my @matches = grep(/$ptn/,@cycleFileList);
-	if( int($#matches+1) != $expectedVarCount ) 
-		{ return("FAIL","$headline : ".int($#matches+1)." files found for variable $tVar, expected $expectedVarCount\n\n"); }
+
+        # Calculate expectedVarCount dynamically for this specific variable
+        my $expectedVarCount = $memberCount * ($VARS_384{$tVar} ? $stepsPt : $stepsStandard);
+
+        my $foundCount = scalar(@matches);
+        if ($foundCount != $expectedVarCount) {
+            return("FAIL", "$headline : $foundCount files found for variable $tVar, expected $expectedVarCount\n\n");
+        } else {
+            print STDOUT " * Verified $tVar: $foundCount / $expectedVarCount files present.\n";
+        }
+
 	}
+
+#	if( int($#matches+1) != $expectedVarCount ) 
+#		{ return("FAIL","$headline : ".int($#matches+1)." files found for variable $tVar, expected $expectedVarCount\n\n"); }
+#	}
 
 	# Run tigge_check scanner / var
 my $TIGGE_CHECK = "${ncdcTigge::GRIB_API_BIN}/tigge_check";
@@ -915,7 +1010,6 @@ sub runCycle($;$) {
             return(10);
             }
     }
-
 
     # QC Passed, throw the switch!
     # Note - the ncdcTigge application needs to be run with cwd ".", 
@@ -1343,6 +1437,15 @@ opendir( DIR,$archiveTargetDir );
 closedir(DIR);
 
 ncdcTigge::mergeRecords( $archiveTargetDir, $archiveTargetDir, $cycle );
+ncdcTigge::convertToCCSDS( $archiveTargetDir, $archiveTargetDir, $cycle );
+
+if ( $isTestMode ) {
+    my $testRtn = ncdcTigge::setTestStatus( $archiveTargetDir, $archiveTargetDir, $cycle );
+    if ( $testRtn != 0 ) {
+        die "Aborting archive creation: setTestStatus failed with code $testRtn\n";
+    }
+}
+
 print STDOUT "Merging into master archive: $masterArchive\n\n";
 unlink($masterArchive);
 my @tarRtn =  (`tar -cf $masterArchive z_tigge_c_kwbc_${cycle}0000_*.grib`);
@@ -1547,6 +1650,146 @@ sub mergeRecords($$$)
 
 
 #
+#       Converts grib2 files to grid_ccsds compression (Requested Oct. 2026)
+#
+sub convertToCCSDS($$$) {
+    my $headline = "$0:ncdcTigge::convertToCCSDS(@_)";
+    my $dir    = shift(@_);
+    my $dirOut = shift(@_);
+    my $cyc    = shift(@_);
+
+    if ( $cyc !~ m/^\d{10}$/ ) { return(1); }
+    if ( !(-d $dir) || !(-r $dir) ) { return(2); }
+
+    if ( $dirOut eq "" ) { $dirOut = $dir; }
+    if ( !(-d $dirOut) ) { mkdir($dirOut); }
+    if ( !(-d $dirOut) ) { $dirOut = $dir; }
+
+    # Use grib_set from the module eccodes-2.33.0 from spack-stack 1.9.2 for now
+    my $GRIB_SET = "$ENV{eccodes_ROOT}/bin/grib_set";
+    if ( !(-e $GRIB_SET) ) {
+        print STDERR "### $headline : $GRIB_SET executable was not found!\n\n";
+        return(2);
+    }
+    if ( !(-x $GRIB_SET) ) {
+        print STDERR "### $headline : $GRIB_SET is not executable!\n\n";
+        return(2);
+    }
+
+    # Prepend input directory path to glob pattern
+    my $pattern = "${dir}/z_tigge_c_kwbc_${cyc}0000_*.grib";
+    my @gribFiles = glob($pattern);
+
+    if ( $#gribFiles <= -1 ) { return(-16); }
+
+    print STDOUT "Converting " . scalar(@gribFiles) . " GRIB2 files to CCSDS packing...\n";
+
+    my @checkConvertErrors;
+
+    foreach my $inFile (@gribFiles) {
+        my $baseName = File::Basename::basename($inFile);
+        my $outFile = "${dirOut}/${baseName}";
+        my $tmpFile = "${outFile}.tmp";
+
+        my @rtn = `$GRIB_SET -w isGridded=1 -r -s packingType=grid_ccsds $inFile $tmpFile 2>&1`;
+
+        if ( $#rtn > -1 ) {
+            push(@checkConvertErrors, "Error converting $inFile: @rtn");
+            unlink($tmpFile) if -e $tmpFile;
+        } else {
+            if (-s $tmpFile) {
+                # In-place replace or write to distinct output directory
+                rename($tmpFile, $outFile);
+                print STDOUT "Successfully converted $baseName\n";
+            } else {
+                push(@checkConvertErrors, "Error: $inFile conversion failed silently.\n");
+                unlink($tmpFile) if -e $tmpFile;
+            }
+        }
+    }
+
+    print STDOUT "Finished CCSDS conversion.\n\n";
+
+    if (@checkConvertErrors) {
+        print STDERR "The following errors occurred during conversion:\n";
+        print STDERR @checkConvertErrors;
+        return(8);
+    } else {
+        print STDOUT "The conversion completed without errors.\n";
+        return(0);
+    }
+}
+
+sub setTestStatus($$$) {
+    my $headline = "$0:ncdcTigge::setTestStatus(@_)";
+    my $dir      = shift(@_);
+    my $dirOut   = shift(@_);
+    my $cyc      = shift(@_);
+
+    if ( $cyc !~ m/^\d{10}$/ ) { return(1); }
+    if ( !(-d $dir) || !(-r $dir) ) { return(2); }
+
+    if ( $dirOut eq "" ) { $dirOut = $dir; }
+    if ( !(-d $dirOut) ) { mkdir($dirOut); }
+    if ( !(-d $dirOut) ) { $dirOut = $dir; }
+
+    my $GRIB_SET = "$ENV{eccodes_ROOT}/bin/grib_set";
+    if ( !(-e $GRIB_SET) ) {
+        print STDERR "### $headline : $GRIB_SET executable was not found!\n\n";
+        return(2);
+    }
+    if ( !(-x $GRIB_SET) ) {
+        print STDERR "### $headline : $GRIB_SET is not executable!\n\n";
+        return(2);
+    }
+
+    my $pattern = "${dir}/z_tigge_c_kwbc_${cyc}0000_*_prod_*.grib";
+    my @gribFiles = glob($pattern);
+
+    if ( $#gribFiles <= -1 ) { return(-16); }
+
+    print STDOUT "Updating " . scalar(@gribFiles) . " GRIB2 files to TIGGE test status (5)...\n";
+
+    my @checkErrors;
+    foreach my $inFile (@gribFiles) {
+        my $baseName = File::Basename::basename($inFile);
+        my $testName = $baseName;
+        $testName =~ s/_prod_/_test_/;
+
+        my $outFile = "${dirOut}/${testName}";
+        my $tmpFile = "${outFile}.tmp";
+
+        my @rtn = `$GRIB_SET -s productionStatusOfProcessedData=5 $inFile $tmpFile 2>&1`;
+
+        if ( $#rtn > -1 ) {
+            push(@checkErrors, "Error updating test status on $inFile: @rtn");
+            unlink($tmpFile) if -e $tmpFile;
+        } else {
+            if (-s $tmpFile) {
+                rename($tmpFile, $outFile);
+                # Remove original _prod_ file when operating in-place so tar doesn't grab both
+                if ($inFile ne $outFile && $dir eq $dirOut) {
+                    unlink($inFile);
+                }
+                print STDOUT "Updated to test: $testName\n";
+            } else {
+                push(@checkErrors, "Error: $inFile test status update failed silently.\n");
+                unlink($tmpFile) if -e $tmpFile;
+            }
+        }
+    }
+
+    if (@checkErrors) {
+        print STDERR "The following errors occurred while setting test status:\n";
+        print STDERR @checkErrors;
+        return(8);
+    } else {
+        print STDOUT "Test status update completed without errors.\n\n";
+        return(0);
+    }
+}
+
+#
 #       Utility function - obtains dates from gens filenames
 #
 sub getDTGfromGensFileName($$)
@@ -1720,9 +1963,39 @@ X)  Ships the data to an FTP server at NCAR
                 3->      String  Cycle "yyyymmddhh" to target within input directory.
 		<-	INT Return code   non-zero means the operation aborted.
 
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        sub convertToCCSDS($$$)
+                Converts all GRIB2 files in a given directory for a given cycle
+                to CCSDS packing using ecCodes grib_set.
+
+                1->      PATH    Input directory containing target GRIB2 files
+                2->      PATH    Output directory for converted files
+                3->      String  Cycle "yyyymmddhh" to target within input directory
+                <-       INT     Return code:
+                                   0  = Success (all matching files converted)
+                                   1  = Invalid cycle format
+                                   2  = Missing/unreadable dir or grib_set executable
+                                  -16 = No matching GRIB files found
+                                   8  = Conversion failure on one or more files
+
  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+sub setTestStatus($$$)
+                Updates GRIB2 productionStatusOfProcessedData to 5 (TIGGE test)
+                and renames _prod_ files to _test_ for a given cycle.
 
+                1->      PATH    Input directory containing GRIB2 files
+                2->      PATH    Output directory (same as input for in-place)
+                3->      String  Cycle "YYYYMMDDHH" to target within input directory
+                <-       INT     Return code:
+                                   0  = Success
+                                   1  = Invalid cycle format
+                                   2  = Missing/unreadable dir or grib_set executable
+                                  -16 = No matching _prod_ GRIB files found
+                                   8  = Header update failure on one or more files
+
+ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 =head2 EXPORT
 
